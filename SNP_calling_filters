@@ -1,7 +1,10 @@
 ################################################################################
-# SNP calling (FreeBayes) + filtering + LD decay (PopLDdecay)
+# Population genomics pipeline: mapping -> SNP calling (FreeBayes) -> filtering
+# -> LD decay (PopLDdecay) -> population statistics
 #
-# This is a step-by-step guide, not a script to be executed end-to-end.
+# This is a step-by-step guide (run one block at a time, replacing <placeholders>),
+# not a script to be executed end-to-end. Steps that process many individuals are
+# parallelized with GNU parallel.
 #
 # Software and repositories:
 #   - FreeBayes v1.3.7 : https://github.com/freebayes/freebayes
@@ -11,89 +14,162 @@
 #   - PopLDdecay       : https://github.com/BGI-shenzhen/PopLDdecay
 ################################################################################
 
-################################################################################
-# 0. RAW READ QC
-################################################################################
-
-## 0.1. Get the metrics for the raw reads
-
-fastq-stats <my_reads_R1.fq.gz> > <my_reads_R1.stats.txt>
 
 ################################################################################
-# 1. READ PROCESSING
+# 0. SETUP: LIST OF INDIVIDUALS (input for all the parallelized steps)
 ################################################################################
 
-## 1.1. Process the raw reads (adapter removal + quality/length trimming)
-##
+## 0.1. Create the 'inds' file: one sample name per line
+##      WHY: GNU parallel reads this file and launches one job per individual, so
+##      every step below uses the same sample names (the prefix of the raw reads).
+##      Raw reads are expected as <sample>_R1.fq.gz and <sample>_R2.fq.gz.
+
+ls *_R1.fq.gz | sed 's/_R1.fq.gz$//' > inds
+
+## 0.2. Plan the resources BEFORE launching parallel jobs
+##      Total CPUs used = (parallel -j) x (threads per job).
+##      e.g., -j 3 with 12 threads each = 36 CPUs. Also keep in mind the RAM:
+##      bwa-mem2 loads its (large) index in every job, and samtools sort uses
+##      memory per thread.
+
+
+################################################################################
+# 1. RAW READ QC AND PROCESSING
+################################################################################
+
+## 1.1. Get the metrics for the raw reads
+
+cat inds | parallel -j 5 'fastq-stats {}_R1.fq.gz > {}_R1.stats.txt'
+
+## 1.2. Process the raw reads (adapter removal + quality/length trimming)
 ##      -q 30 : trim bases with Phred quality < 30
 ##      -l 50 : discard reads shorter than 50 bp after trimming (short reads map
 ##              ambiguously and inflate multi-mapping)
-##      IlluminaAdapters_V2.fasta is a lits with all the adaptors sequence for
-##      the Illumina platforms
 
-fastq-mcf -q 30 -l 50 \
-  -o <my_reads_q30l50_R1.fq.gz> -o <my_reads_q30l50_R2.fq.gz> \
-  ~/IlluminaAdapters_V2.fasta <my_reads_R1.fq.gz> <my_reads_R2.fq.gz>
+cat inds | parallel -j 5 'fastq-mcf -q 30 -l 50 \
+  -o {}_q30l50_R1.fq.gz -o {}_q30l50_R2.fq.gz \
+  ~/IlluminaAdapters_V2.fasta {}_R1.fq.gz {}_R2.fq.gz'
 
-## 1.2. Get the metrics for the processed reads
+## 1.3. Get the metrics for the processed reads
 
-fastq-stats <my_reads_q30l50_R1.fq.gz> > <my_reads_q30l50_R1.stats.txt>
+cat inds | parallel -j 5 'fastq-stats {}_q30l50_R1.fq.gz > {}_q30l50_R1.stats.txt'
 
 
 ################################################################################
-# 2. MAPPING
+# 2. MAPPING (parallelized by individual)
 ################################################################################
 
 ## 2.0. Index the reference genome
 
-bwa index <my_reference_genome.fasta>
+bwa-mem2 index <my_reference_genome.fasta>
+samtools faidx <my_reference_genome.fasta>    # needed later by FreeBayes
 
-## 2.1. Map the processed reads to the reference genome (with 24 threads)
+##      Optional: if the reference contains contaminant sequences, either map to
+##      a decontaminated version of the genome (e.g., *_DESCONT.fasta) OR map to
+##      the full genome and remove the contaminant regions at the filtering step
+##      (--exclude-bed <contaminants.bed>, see 5.1).
 
-##      Attetion: If you are seeking only SNP calling, add the 
-##      "samtools view -F 4" to drops unmapped reads (flag 4), keeping the BAM small
-##      If you intend to call SVs latter, do as following
-##      -b : output BAM (compressed) instead of SAM
+## 2.1. Wrapper script to align ONE individual (save as align_sample.sh and run
+##      chmod +x align_sample.sh)
+##      WHY: mapping + conversion + sorting are piped together, so no
+##      intermediate unsorted BAM is written to disk.
+##      - No "-F 4": unmapped reads are kept in the BAM. They carry information
+##        for structural variant (SV) detection (e.g., insertions of sequence
+##        absent in the reference, evidence of one-end-anchored pairs). SNP calling
+##        with FreeBayes ignores them anyway. If disk space is a problem, "-F 4" can
+##        be added to "samtools view" for a SNP-only BAM.
+##      - Coordinate sorting is required for indexing, merging and variant calling.
 
-bwa mem -t 24 <my_reference_genome.fasta> \
-  <my_reads_q30l50_R1.fq.gz> <my_reads_q30l50_R2.fq.gz> \
-  | samtools view -Sb -o <my_reads.bwa.ref.bam> -
+cat > align_sample.sh <<'EOF'
 
-## 2.2. Sort the mapping files by coordinates
+#!/bin/bash
+# Usage: ./align_sample.sh <sample>
+set -euo pipefail
 
-samtools sort -@ 24 -o <my_reads.bwa.ref.sorted.bam> <my_reads.bwa.ref.bam>
+REF=<PATH>/<my_reference_genome.fasta>
+OUTDIR=align_output
+SAMPLE=$1
+
+mkdir -p ${OUTDIR}
+echo "Aligning ${SAMPLE} with bwa-mem2"
+
+bwa-mem2 mem -t 12 ${REF} \
+    ${SAMPLE}_q30l50_R1.fq.gz ${SAMPLE}_q30l50_R2.fq.gz \
+  | samtools view -@ 4 -b - \
+  | samtools sort -@ 4 -T ${OUTDIR}/${SAMPLE}.tmp -o ${OUTDIR}/${SAMPLE}_sort.bam -
+EOF
+chmod +x align_sample.sh
+
+## 2.2. Run the wrapper for all the individuals in parallel
+##      -j 3 jobs x 12 bwa threads (+8 for samtools) per job: adjust to the server
+
+cat inds | parallel -j 3 ./align_sample.sh {}
+
+##      Alternative without a wrapper (map and sort in separate steps):
+## cat inds | parallel -j 5 'bwa-mem2 mem -t 12 <my_reference_genome.fasta> \
+##   {}_q30l50_R1.fq.gz {}_q30l50_R2.fq.gz | samtools view -@ 10 -b -o {}_ref.bam'
+## ls *_ref.bam | parallel -j 3 'samtools sort -@ 12 -o {.}.sorted.bam {}'
 
 ## 2.3. Get the mapping metrics for each of the samples
+##      WHY: mapping rate, insert size, error rate and mean coverage per sample
+##      help identify failed or contaminated samples that should be excluded
+##      before calling variants.
 
-samtools stats -@ 24 <my_reads.bwa.ref.sorted.bam> > <my_reads.bwa.ref.mapping_stats.txt>
-
-## 2.4. Merge the mapping files and add RG
-
-bamaddrg -b <my_sample1.bwa.ref.sorted.bam> -s <sample1> \
-         -b <my_sample2.bwa.ref.sorted.bam> -s <sample2> \
-         > <all_samples.bam>
+cat inds | parallel -j 5 'samtools stats -@ 4 align_output/{}_sort.bam > align_output/{}.mapping_stats.txt'
 
 
 ################################################################################
-# 3. VARIANT CALLING
+# 3. READ GROUPS AND MERGING
+################################################################################
+## FreeBayes needs to know which sample each read belongs to (read group).
+## bamaddrg adds it. Two options:
+
+## 3.1. Option A: merge all the BAMs into a single file (used with FreeBayes
+##      -b / MultiThreadFreeBayes -b)
+##      WHY: allows joint calling across all samples, which improves sensitivity
+##      for low-coverage samples and gives one consistent set of sites.
+##      The command is built from the 'inds' file to avoid typing each BAM.
+
+cd align_output
+args=()
+while read s; do args+=(-b ${s}_sort.bam -s ${s}); done < ../inds
+bamaddrg "${args[@]}" > ../all_samples.bam
+cd ..
+
+## 3.2. Option B: add the read group to each BAM separately (parallelized) and keep
+##      one BAM per sample (used with FreeBayes --bam-list)
+##      WHY: avoids creating one huge file and can be run per individual.
+
+mkdir -p BamRG
+
+cat inds | parallel -j 5 'bamaddrg -b align_output/{}_sort.bam -s {} > BamRG/{}_RG_sort.bam'
+
+ls BamRG/*_RG_sort.bam | parallel -j 5 'samtools index -@ 2 {}'
+
+ls $PWD/BamRG/*_RG_sort.bam > bam_list.txt
+
+## 3.3. Generate an index for the merged mapping file
+##      WHY: FreeBayes needs random access to the BAM (.bai) and to the reference
+##      (.fai, created in 2.0).
+
+samtools index all_samples.bam
+
+
+################################################################################
+# 4. VARIANT CALLING
 ################################################################################
 
-## 3.1. Generate an index for the mapping and the reference files
-
-samtools index <all_samples.bam>
-samtools faidx <my_reference_genome.fasta>
-
-## 3.2. Perform the variant calling for all the samples
+## 4.1. Perform the variant calling for all the samples
 ##
 ##  !!! WARNING: MEMORY USAGE !!!
 ##  Depending on the complexity of the genome (size, repeat content, ploidy,
-##  heterozygosity, number of samples and depth), this parallel version of 
-##  FreeBayes can use MUCH more memory than is available on the machine. 
-##  Memory grows with the number of parallel processes, so be careful with the 
-##  number of threads (-t) when using the parallel wrapper below.
-##  Start with a small number of threads, monitor RAM (htop, free -h, /usr/bin/time -v) 
-##  and increase gradually. If the process is killed (OOM) reduce the threads, 
-##  reduce --limit-coverage, or split the genome into smaller windows.
+##  heterozygosity, number of samples and depth), FreeBayes can use MUCH more
+##  memory than is available on the machine. Memory grows with the number of
+##  parallel processes, so be careful with the number of threads (-t) when using
+##  the parallel wrapper below. Start with a small number of threads, monitor
+##  RAM (htop, free -h, /usr/bin/time -v) and increase gradually. If the
+##  process is killed (OOM), reduce the threads, reduce --limit-coverage, or
+##  split the genome into smaller windows.
 ##
 ##  Arguments used to improve the variant call:
 ##    -m / --min-mapping-quality 30 : ignore reads with MAPQ < 30 (ambiguous
@@ -101,7 +177,6 @@ samtools faidx <my_reference_genome.fasta>
 ##    -q / --min-base-quality 30    : ignore bases with Phred < 30 (sequencing
 ##                                    errors)
 ##    --min-coverage 5              : do not call sites covered by < 5 reads
-##                                    (not enough evidence for a genotype)
 ##    --limit-coverage 5000         : downsample sites above this depth. Very
 ##                                    deep sites are usually collapsed repeats/
 ##                                    paralogs and cost a lot of RAM and time.
@@ -115,12 +190,6 @@ samtools faidx <my_reference_genome.fasta>
 ##    (-u is used below: complex events complicate haplotype-based calling and
 ##     are not needed when only SNPs are wanted)
 
-## Single process (small genomes / few samples):
-
-freebayes -f <my_reference_genome.fasta> -m 30 -q 30 -u \
-  --min-coverage 5 --limit-coverage 5000 \
-  <all_samples.bam> > <all_samples.vcf>
-
 ## For big genomes, use the in-house Perl wrapper by abombarely that splits the genome into
 ## windows and runs FreeBayes in parallel processes, merging the results.
 ## WHY: FreeBayes is single-threaded; splitting makes it feasible on large data.
@@ -131,111 +200,116 @@ freebayes -f <my_reference_genome.fasta> -m 30 -q 30 -u \
   -o <all_samples.variant_call> -t <N_THREADS_CHECK_RAM> \
   -p '-u;-m=30;-q=30;--limit-coverage=5000;--min-coverage=5'
 
-## 3.3. Get the variant call metrics
+## 4.2. Get the variant call metrics
+##      WHY: compress/index the VCF (saves disk, allows fast region queries and is
+##      required by several tools) and summarize it (number of SNPs/indels, Ts/Tv,
+##      etc.) to evaluate the quality of the call before filtering.
 
-bgzip --threads 24 <all_samples.vcf>
-tabix -p vcf <all_samples.vcf.gz>
-vcf-stats <all_samples.vcf.gz> -p <all_samples.variant_stats/>
+bgzip --threads 24 all_samples.vcf
+
+tabix -p vcf all_samples.vcf.gz
+
+vcf-stats all_samples.vcf.gz -p all_samples.variant_stats/
 
 
 ################################################################################
-# 4. VARIANT FILTERING
+# 5. VARIANT FILTERING (VCFtools)
 ################################################################################
-## The variant filtering is linked to the downstream analysis.
+## The filtering is linked to the downstream analysis.
 ## For some analyses it is important to remove low-frequency variants
 ## (MAF < 0.05; e.g., quantitative genetics, PCA, GWAS), while for others it is
 ## important to keep them (e.g., search for specific alleles to identify a
-## variety).
-##
-## Filters 4.1.1 to 4.1.4 reproduce the set used in the Methods:
-## "QUAL > 30, minimum depth 5, maximum depth 5,000, no missing data,
-##  no indels, biallelic only". Filters 4.2.x are OPTIONAL, depending on the
-## analysis.
+## variety). Section 5.1 is the base SNP set; the following ones are optional.
 
-## 4.1.1. Keep only high-quality sites (QUAL > 30)
-##        WHY: QUAL is the Phred-scaled probability that the site is polymorphic.
-##        Low QUAL sites are likely sequencing/mapping artifacts.
-##        (The depth limits, min 5 / max 5,000, were already applied at calling
-##        time via --min-coverage and --limit-coverage.)
+## 5.1. Base high-quality SNP set (all filters in a single pass)
+##      Filters (the same as in the Methods):
+##      --minQ 30             : QUAL > 30. QUAL is the Phred-scaled probability that
+##                              the site is polymorphic; low QUAL = likely artifact.
+##      --max-missing 1.0     : no missing data (sites genotyped in ALL samples).
+##                              Needed by PCA, LD and many structure tools. Relax
+##                              (e.g., 0.8) if too many SNPs are lost.
+##      --min-alleles 2 --max-alleles 2 : biallelic only. Most population-genetics
+##                              models assume 2 alleles; multiallelic sites are
+##                              often errors or paralogous mapping.
+##      --remove-indels       : SNPs only. Indels have different error profiles and
+##                              are often mis-called near repeats/homopolymers.
+##      --exclude-bed         : (optional) remove regions of contaminant origin
+##                              identified in the genome (BED file). Remove this
+##                              argument if you mapped to a decontaminated genome.
+##      (Depth limits, min 5 / max 5,000, were applied at calling: 4.1.)
+##      Using a single command is equivalent to running each filter in sequence,
+##      but much faster for large VCFs (tens of millions of sites). To see how many
+##      sites each filter removes, run them one at a time, passing the .recode.vcf
+##      of the previous step.
 
-vcftools --gzvcf <all_samples.vcf.gz> --minQ 30 \
-  --out <all_samples_f00_Q30> --recode --recode-INFO-all
+vcftools --gzvcf all_samples.vcf.gz \
+  --minQ 30 --max-missing 1.0 \
+  --min-alleles 2 --max-alleles 2 --remove-indels \
+  --exclude-bed <contaminants.bed> \
+  --out all_samples_f03_nomis_bial_SNPs --recode --recode-INFO-all
 
-## 4.1.2. (Optional but recommended) Check the depth distribution
-##        WHY: confirms that the depth limits are sensible for this dataset.
-##        Sites with extremely high depth are usually collapsed repeats or
-##        paralogs; if needed, remove them (e.g., --max-meanDP).
+## (if MNPs remain: bcftools view -v snps <in.vcf> > <out.vcf>)
 
-vcftools --vcf <all_samples_f00_Q30.recode.vcf> --site-mean-depth \
-  --out <all_samples_f00_Q30>
+## 5.2. (Optional) Check the depth distribution
+##      WHY: confirms that the depth limits are sensible. Sites with extremely high
+##      depth are usually collapsed repeats/paralogs.
 
-## Optional filter on the mean depth across samples:
-## vcftools --vcf <all_samples_f00_Q30.recode.vcf> --min-meanDP 5 --max-meanDP 5000 \
-##   --out <all_samples_f00b_depth> --recode --recode-INFO-all
+vcftools --vcf all_samples_f03_nomis_bial_SNPs.recode.vcf --site-mean-depth \
+  --out all_samples_f03_nomis_bial_SNPs
+## vcftools --vcf <in.vcf> --min-meanDP 5 --max-meanDP 5000 --out <out> --recode --recode-INFO-all
 
-## 4.1.3. Remove the missing data
-##        WHY: many downstream methods (PCA, LD, some population-structure
-##        software) cannot handle missing genotypes. --max-missing 1.0 keeps
-##        only sites genotyped in ALL samples. Relax this (e.g., 0.8) if too
-##        many SNPs are lost.
+## 5.3. (Optional) Remove individuals that do not belong to the analysis
+##      WHY: e.g., samples from other populations/species. 'inds_otherPops.txt' has
+##      one sample name per line, as in the VCF header:
+##          CAPES26
+##          CARMG16P
+##          ...
 
-vcftools --vcf <all_samples_f00_Q30.recode.vcf> --max-missing 1.0 \
-  --out <all_samples_f01_nomissing> --recode --recode-INFO-all
+vcftools --vcf all_samples_f03_nomis_bial_SNPs.recode.vcf \
+  --remove inds_otherPops.txt \
+  --out all_samples_f04_nomis_bial_SNPs_noOthers --recode --recode-INFO-all
+bgzip all_samples_f04_nomis_bial_SNPs_noOthers.recode.vcf
+tabix -p vcf all_samples_f04_nomis_bial_SNPs_noOthers.recode.vcf.gz
 
-## 4.1.4. Select only biallelic variants
-##        WHY: most population-genetics models and tools assume two alleles per
-##        site. Multiallelic sites are often genotyping errors or paralogous
-##        mapping.
+## >>> all_samples_f04_nomis_bial_SNPs_noOthers.recode.vcf.gz is the base SNP set
+## >>> and the input for LD decay (section 6). It is NOT thinned and NOT MAF-filtered.
 
-vcftools --vcf <all_samples_f01_nomissing.recode.vcf> \
-  --min-alleles 2 --max-alleles 2 \
-  --out <all_samples_f02_biallelic> --recode --recode-INFO-all
+## 5.4. (Optional) Select only variants with MAF > 0.05
+##      WHY: rare alleles are the most affected by genotyping errors and carry
+##      little information in PCA/GWAS with few samples. Do NOT apply it if rare
+##      alleles are of interest.
 
-## 4.1.5. Remove InDels
-##        WHY: indels have different error profiles and mutation rates than SNPs
-##        and are often mis-called near homopolymers/repeats. Only SNPs are kept.
-##        (This assumes that other variant types like complex events have been
-##        removed already -u in 3.2. MNPs, if present, can be removed with:
-##        bcftools view -v snps)
+vcftools --gzvcf all_samples_f04_nomis_bial_SNPs_noOthers.recode.vcf.gz \
+  --maf 0.05 --max-maf 0.95 \
+  --out all_samples_f06_nomis_bial_SNPs_noOthers_MAF --recode --recode-INFO-all
+##      (Combined version for the whole dataset in one command:
+##       --max-missing 1.0 --min-alleles 2 --max-alleles 2 --maf 0.05 --max-maf 0.95)
 
-vcftools --vcf <all_samples_f02_biallelic.recode.vcf> --remove-indels \
-  --out <all_samples_f03_only_snps> --recode --recode-INFO-all
+## 5.5. (Optional) Subsets by genomic feature: sites inside / outside genes
+##      WHY: to compare variation in genic vs. non-genic regions.
+##      RAN_gene_3columns.bed: chromosome, start, end of each gene.
 
-## >>> <all_samples_f03_only_snps.recode.vcf> is the high-quality SNP set
-## >>> described in the Methods. It is also the input for the LD decay analysis
-## >>> (section 5) and for any analysis that should NOT be thinned.
+vcftools --vcf <thinned_or_base.vcf> --bed RAN_gene_3columns.bed \
+  --out <prefix>_genesIN --recode --recode-INFO-all
+vcftools --vcf <thinned_or_base.vcf> --exclude-bed RAN_gene_3columns.bed \
+  --out <prefix>_genesOUT --recode --recode-INFO-all
 
-## ---- OPTIONAL filters (analysis dependent) ----
+## 5.6. (Optional) Convert to PLINK (e.g., for GWAS)
 
-## 4.2.1. Select only variants with MAF > 0.05
-##        WHY: rare alleles are the most affected by genotyping errors and carry
-##        little information in analyses like PCA or GWAS with few samples.
-##        Do NOT apply it if rare alleles are of interest.
-
-vcftools --vcf <all_samples_f03_only_snps.recode.vcf> --maf 0.05 --max-maf 0.95 \
-  --out <all_samples_f04_MAF005> --recode --recode-INFO-all
-
-## 4.2.2. Select only one variant each 1 Kb
-##        WHY: reduces linkage between neighbouring SNPs, giving an approximately
-##        independent set of markers (needed for e.g. STRUCTURE/ADMIXTURE, Ne,
-##        demographic inference).
-##        Do NOT use it for LD decay: thinning removes exactly the short-distance
-##        pairs that are needed to estimate it.
-
-## vcftools --vcf <all_samples_f04_MAF005.recode.vcf> --thin 1000 \
-##   --out <all_samples_f05_by1Kb> --recode --recode-INFO-all
+python3 /data/users/aecyop/programas/gwas_analysis/create_plink_file.py \
+  --vcf all_samples_f06_nomis_bial_SNPs_noOthers_MAF.recode --out all_f06
 
 
 ################################################################################
-# 5. LD DECAY (PopLDdecay)
+# 6. LD DECAY (PopLDdecay)
 ################################################################################
 ## WHY: LD decay shows how fast linkage disequilibrium (r2) drops with physical
-## distance. It reflects recombination rate, effective population size,
-## population history (bottlenecks, admixture, selection) and breeding system,
-## and tells you how dense the markers must be for GWAS/GEA and how far a
-## selective sweep extends.
+## distance. It reflects recombination, effective population size, population
+## history and breeding system. It also tells you the distance at which SNPs can
+## be considered independent, which is used to choose the thinning distance (7.1).
 
-## 5.1. Install PopLDdecay (once)
+## 6.1. Install PopLDdecay (once)
+
 git clone https://github.com/BGI-shenzhen/PopLDdecay.git
 cd PopLDdecay
 chmod 755 configure
@@ -243,58 +317,74 @@ chmod 755 configure
 make
 mv PopLDdecay bin/     # the binary and the plotting scripts are then in ./bin
 cd ..
+POPLD=/data/users/aecyop/programas/PopLDdecay/PopLDdecay-3.42/bin   # adjust
 
-## 5.2. Run the LD decay for the whole dataset
-##      Input: the filtered, NON-thinned SNP VCF (4.1.5).
-##      -MaxDist : maximum distance (kb) between SNP pairs (default 300). Adjust
-##                 to the expected LD decay range of the species / genome size.
-##      -MAF     : minimum minor allele frequency. Low-frequency SNPs give noisy
-##                 r2 estimates; 0.05 is a common choice (default 0.005).
-##      -Het / -Miss : maximum heterozygosity / missing rate per site (defaults
-##                 0.88 / 0.25; missing data was already removed in 4.1.3).
+## 6.2. LD decay for all the individuals
+##      Input: base SNP set (5.3). Do NOT thin it: thinning removes exactly the
+##      short-distance pairs needed to estimate LD decay.
+##      -MaxDist : maximum distance (kb) between SNP pairs (default 300)
+##      -MAF     : minimum MAF (default 0.005; 0.05 reduces noise from rare SNPs)
+##      -Het / -Miss : max heterozygosity / missing rate per site (defaults
+##                 0.88 / 0.25; missing data was already removed in 5.1)
 
-PopLDdecay -InVCF <all_samples_f03_only_snps.recode.vcf> \
-  -OutStat <LDdecay_all> -MaxDist 300 -MAF 0.05
+VCF=all_samples_f04_nomis_bial_SNPs_noOthers.recode.vcf.gz
+${POPLD}/PopLDdecay -InVCF ${VCF} -OutStat run1_out.stat -MaxDist 300 -MAF 0.05
+${POPLD}/Plot_OnePop.pl -inFile run1_out.stat.gz -output run1_allInds
 
-## 5.3. (Optional) Run it separately for each population / group
-##      WHY: LD decay often differs between populations (e.g., low vs. high
-##      elevation) and mixing groups with population structure inflates LD.
-##      <popX.samples.txt> = one sample name per line (as in the VCF header).
+## 6.3. LD decay per population
+##      WHY: LD decay often differs between populations, and mixing groups with
+##      population structure inflates LD.
+##      <POP>.txt = one sample name per line (same lists used for Fst/pi in 8.x).
 
-PopLDdecay -InVCF <all_samples_f03_only_snps.recode.vcf> \
-  -SubPop <pop1.samples.txt> -OutStat <LDdecay_pop1> -MaxDist 300 -MAF 0.05
-PopLDdecay -InVCF <all_samples_f03_only_snps.recode.vcf> \
-  -SubPop <pop2.samples.txt> -OutStat <LDdecay_pop2> -MaxDist 300 -MAF 0.05
+for POP in COR ITA MAC MAR PAP PES RAN UBA; do
+  ${POPLD}/PopLDdecay -InVCF ${VCF} -OutStat ${POP}_out.stat \
+    -SubPop ${POP}.txt -MaxDist 300 -MAF 0.05
+done
 
-## 5.4. Plot the LD decay
-##      One population:
+## 6.4. Plot several populations in one figure
+##      list_allpops.txt: <path_to_stat.gz><TAB><population_name> per line
 
-perl PopLDdecay/bin/Plot_OnePop.pl -inFile <LDdecay_all.stat.gz> -output <LDdecay_all>
+for POP in COR ITA MAC MAR PAP PES RAN UBA; do
+  printf "%s\t%s\n" ${POP}_out.stat.gz ${POP}
+done > list_allpops.txt
+perl ${POPLD}/Plot_MultiPop.pl -inList list_allpops.txt -output Pops_LDdecay
 
-##      Several populations in one plot. <multi.list> has one line per
-##      population: <path_to_stat.gz><TAB><population_name>
-##        LDdecay_pop1.stat.gz   pop1
-##        LDdecay_pop2.stat.gz   pop2
+## 6.5. (Optional) LD between variants within a window, directly in VCFtools
+##      WHY: pairwise r2 values for a specific region or window size.
+##      NOTE: use --geno-r2 for unphased genotypes (FreeBayes output).
+##      --hap-r2 assumes PHASED haplotypes and would give wrong values here.
 
-perl PopLDdecay/bin/Plot_MultiPop.pl -inList <multi.list> -output <LDdecay_pops>
+vcftools --vcf all_samples_f06_nomis_bial_SNPs_noOthers_MAF.recode.vcf \
+  --geno-r2 --ld-window-bp 50000 --out ld_window50k
 
-## 5.5. (Optional) Estimate the half-decay distance and plot in R
-##      WHY: gives a single number (distance at which r2 drops to half of its
-##      maximum) that is easy to report and to compare between populations.
+## 6.6. (Optional) Estimate the half-decay distance in R
 ##      The .stat.gz columns are: Dist, Mean_r^2, Mean_D', Sum_r^2, Sum_D', NumberPair
 
 Rscript - <<'EOF'
-ld <- read.table(gzfile("<LDdecay_all.stat.gz>"), header = TRUE, comment.char = "")
+ld <- read.table(gzfile("run1_out.stat.gz"), header = TRUE, comment.char = "")
 colnames(ld)[1:2] <- c("dist", "r2")
 half <- max(ld$r2, na.rm = TRUE) / 2
 half_dist <- ld$dist[which(ld$r2 <= half)[1]]
 cat("Max mean r2:", max(ld$r2, na.rm = TRUE), "\n")
 cat("Half-decay distance (bp):", half_dist, "\n")
-
-pdf("LDdecay_all_R.pdf", width = 6, height = 4)
-plot(ld$dist / 1000, ld$r2, type = "l", lwd = 2,
-     xlab = "Distance (kb)", ylab = expression(Mean ~ r^2))
-abline(h = half, lty = 2, col = "grey40")
-abline(v = half_dist / 1000, lty = 2, col = "red")
-dev.off()
 EOF
+
+
+################################################################################
+# 7. THINNING (remove linked loci)
+################################################################################
+
+## 7.1. Keep one variant every X bp, with X chosen from the LD decay (section 6)
+##      WHY: reduces linkage between neighbouring SNPs, giving approximately
+##      independent markers (needed for STRUCTURE/ADMIXTURE, Ne, demographic
+##      inference). Rule: use a distance at which LD has decayed (e.g., 50 kb if
+##      LD decays by ~50 kb; 1 kb if LD decays quickly). Smaller distances keep
+##      more SNPs, larger ones keep fewer but more independent SNPs.
+
+vcftools --gzvcf all_samples_f04_nomis_bial_SNPs_noOthers.recode.vcf.gz \
+  --thin 50000 --out all_samples_f05_nomis_bial_SNPs_noOthers_50Kb \
+  --recode --recode-INFO-all
+##   (other examples: --thin 20000, --thin 5000, --thin 1000)
+##   If MAF filtering is also needed (5.4), apply it BEFORE or AFTER thinning,
+##   but be consistent across analyses.
+
